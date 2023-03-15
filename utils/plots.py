@@ -20,9 +20,10 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from utils import TryExcept, threaded
-from utils.general import (CONFIG_DIR, FONT, LOGGER, check_font, check_requirements, clip_coords, increment_path,
+from utils.general import (CONFIG_DIR, FONT, LOGGER, check_font, check_requirements, clip_boxes, increment_path,
                            is_ascii, xywh2xyxy, xyxy2xywh)
 from utils.metrics import fitness
+from utils.segment.general import scale_image
 
 # Settings
 RANK = int(os.getenv('RANK', -1))
@@ -87,7 +88,8 @@ class Annotator:
         if self.pil or not is_ascii(label):
             self.draw.rectangle(box, width=self.lw, outline=color)  # box
             if label:
-                w, h = self.font.getsize(label)  # text width, height
+                w, h = self.font.getsize(label)  # text width, height (WARNING: deprecated) in 9.2.0
+                # _, _, w, h = self.font.getbbox(label)  # text width, height (New)
                 outside = box[1] - h >= 0  # label fits outside box
                 self.draw.rectangle(
                     (box[0], box[1] - h if outside else box[1], box[0] + w + 1,
@@ -113,6 +115,36 @@ class Annotator:
                             thickness=tf,
                             lineType=cv2.LINE_AA)
 
+    def masks(self, masks, colors, im_gpu, alpha=0.5, retina_masks=False):
+        """Plot masks at once.
+        Args:
+            masks (tensor): predicted masks on cuda, shape: [n, h, w]
+            colors (List[List[Int]]): colors for predicted masks, [[r, g, b] * n]
+            im_gpu (tensor): img is in cuda, shape: [3, h, w], range: [0, 1]
+            alpha (float): mask transparency: 0.0 fully transparent, 1.0 opaque
+        """
+        if self.pil:
+            # convert to numpy first
+            self.im = np.asarray(self.im).copy()
+        if len(masks) == 0:
+            self.im[:] = im_gpu.permute(1, 2, 0).contiguous().cpu().numpy() * 255
+        colors = torch.tensor(colors, device=im_gpu.device, dtype=torch.float32) / 255.0
+        colors = colors[:, None, None]  # shape(n,1,1,3)
+        masks = masks.unsqueeze(3)  # shape(n,h,w,1)
+        masks_color = masks * (colors * alpha)  # shape(n,h,w,3)
+
+        inv_alph_masks = (1 - masks * alpha).cumprod(0)  # shape(n,h,w,1)
+        mcs = (masks_color * inv_alph_masks).sum(0) * 2  # mask color summand shape(n,h,w,3)
+
+        im_gpu = im_gpu.flip(dims=[0])  # flip channel
+        im_gpu = im_gpu.permute(1, 2, 0).contiguous()  # shape(h,w,3)
+        im_gpu = im_gpu * inv_alph_masks[-1] + mcs
+        im_mask = (im_gpu * 255).byte().cpu().numpy()
+        self.im[:] = im_mask if retina_masks else scale_image(im_gpu.shape, im_mask, self.im.shape)
+        if self.pil:
+            # convert im back to PIL and update draw
+            self.fromarray(self.im)
+
     def rectangle(self, xy, fill=None, outline=None, width=1):
         # Add rectangle to image (PIL-only)
         self.draw.rectangle(xy, fill, outline, width)
@@ -123,6 +155,11 @@ class Annotator:
             w, h = self.font.getsize(text)  # text width, height
             xy[1] += 1 - h
         self.draw.text(xy, text, fill=txt_color, font=self.font)
+
+    def fromarray(self, im):
+        # Update self.im from a numpy array
+        self.im = im if isinstance(im, Image.Image) else Image.fromarray(im)
+        self.draw = ImageDraw.Draw(self.im)
 
     def result(self):
         # Return annotated image as array
@@ -152,7 +189,6 @@ def feature_visualization(x, module_type, stage, n=32, save_dir=Path('runs/detec
                 ax[i].axis('off')
 
             LOGGER.info(f'Saving {f}... ({n}/{channels})')
-            plt.title('Features')
             plt.savefig(f, dpi=300, bbox_inches='tight')
             plt.close()
             np.save(str(f.with_suffix('.npy')), x[0].cpu().numpy())  # npy save
@@ -180,26 +216,31 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     return filtfilt(b, a, data)  # forward-backward filter
 
 
-def output_to_target(output):
-    # Convert model output to target format [batch_id, class_id, x, y, w, h, conf]
+def output_to_target(output, max_det=300):
+    # Convert model output to target format [batch_id, class_id, x, y, w, h, conf] for plotting
     targets = []
     for i, o in enumerate(output):
-        targets.extend([i, cls, *list(*xyxy2xywh(np.array(box)[None])), conf] for *box, conf, cls in o.cpu().numpy())
-    return np.array(targets)
+        box, conf, cls = o[:max_det, :6].cpu().split((4, 1, 1), 1)
+        j = torch.full((conf.shape[0], 1), i)
+        targets.append(torch.cat((j, cls, xyxy2xywh(box), conf), 1))
+    return torch.cat(targets, 0).numpy()
 
 
 @threaded
-def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=1920, max_subplots=16):
+def plot_images(images, targets, paths=None, fname='images.jpg', names=None):
     # Plot image grid with labels
     if isinstance(images, torch.Tensor):
         images = images.cpu().float().numpy()
     if isinstance(targets, torch.Tensor):
         targets = targets.cpu().numpy()
-    if np.max(images[0]) <= 1:
-        images *= 255  # de-normalise (optional)
+
+    max_size = 1920  # max image size
+    max_subplots = 16  # max image subplots, i.e. 4x4
     bs, _, h, w = images.shape  # batch size, _, height, width
     bs = min(bs, max_subplots)  # limit plot images
     ns = np.ceil(bs ** 0.5)  # number of subplots (square)
+    if np.max(images[0]) <= 1:
+        images *= 255  # de-normalise (optional)
 
     # Build Image
     mosaic = np.full((int(ns * h), int(ns * w), 3), 255, dtype=np.uint8)  # init
@@ -409,7 +450,7 @@ def imshow_cls(im, labels=None, pred=None, names=None, nmax=25, verbose=False, f
     plt.savefig(f, dpi=300, bbox_inches='tight')
     plt.close()
     if verbose:
-        LOGGER.info(f"Saving {f}")
+        LOGGER.info(f'Saving {f}')
         if labels is not None:
             LOGGER.info('True:     ' + ' '.join(f'{names[i]:3s}' for i in labels[:nmax]))
         if pred is not None:
@@ -509,7 +550,7 @@ def save_one_box(xyxy, im, file=Path('im.jpg'), gain=1.02, pad=10, square=False,
         b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # attempt rectangle to square
     b[:, 2:] = b[:, 2:] * gain + pad  # box wh * gain + pad
     xyxy = xywh2xyxy(b).long()
-    clip_coords(xyxy, im.shape)
+    clip_boxes(xyxy, im.shape)
     crop = im[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2]), ::(1 if BGR else -1)]
     if save:
         file.parent.mkdir(parents=True, exist_ok=True)  # make directory

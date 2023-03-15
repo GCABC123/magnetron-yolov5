@@ -4,7 +4,13 @@ utils/initialization
 """
 
 import contextlib
+import platform
 import threading
+
+
+def emojis(str=''):
+    # Return platform-dependent emoji-safe version of string
+    return str.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str
 
 
 class TryExcept(contextlib.ContextDecorator):
@@ -17,7 +23,7 @@ class TryExcept(contextlib.ContextDecorator):
 
     def __exit__(self, exc_type, value, traceback):
         if value:
-            print(f'{self.msg}{value}')
+            print(emojis(f"{self.msg}{': ' if self.msg else ''}{value}"))
         return True
 
 
@@ -31,6 +37,16 @@ def threaded(func):
     return wrapper
 
 
+def join_threads(verbose=False):
+    # Join all daemon threads, i.e. atexit.register(lambda: join_threads())
+    main_thread = threading.current_thread()
+    for t in threading.enumerate():
+        if t is not main_thread:
+            if verbose:
+                print(f'Joining thread {t.name}')
+            t.join()
+
+
 def notebook_init(verbose=True):
     # Check system software and hardware
     print('Checking setup...')
@@ -38,24 +54,25 @@ def notebook_init(verbose=True):
     import os
     import shutil
 
-    from utils.general import check_font, check_requirements, emojis, is_colab
+    from utils.general import check_font, check_requirements, is_colab
     from utils.torch_utils import select_device  # imports
 
-    check_requirements(('psutil', 'IPython'))
     check_font()
 
     import psutil
-    from IPython import display  # to display images and clear console output
 
     if is_colab():
         shutil.rmtree('/content/sample_data', ignore_errors=True)  # remove colab /sample_data directory
 
     # System info
+    display = None
     if verbose:
         gb = 1 << 30  # bytes to GiB (1024 ** 3)
         ram = psutil.virtual_memory().total
-        total, used, free = shutil.disk_usage("/")
-        display.clear_output()
+        total, used, free = shutil.disk_usage('/')
+        with contextlib.suppress(Exception):  # clear display if ipython is installed
+            from IPython import display
+            display.clear_output()
         s = f'({os.cpu_count()} CPUs, {ram / gb:.1f} GB RAM, {(total - free) / gb:.1f}/{total / gb:.1f} GB disk)'
     else:
         s = ''
